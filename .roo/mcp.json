@@ -1,0 +1,43 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "C:\\Users\\lalou\\Documents\\Cline\\MCP\\filesystem",
+        "D:/Files/Capstone/pi-lms"
+      ],
+      "disabled": false,
+      "alwaysAllow": []
+    },
+    "sequentialthinking": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ],
+      "disabled": true,
+      "alwaysAllow": []
+    },
+    "memory": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-memory"
+      ],
+      "disabled": false,
+      "alwaysAllow": []
+    },
+    "browser-tools-mcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@agentdeskai/browser-tools-mcp"
+      ],
+      "cwd": "C:\\Users\\lalou\\Documents\\Cline\\MCP\\browser-tools-mcp",
+      "disabled": true,
+      "alwaysAllow": []
+    }
+  }
+}

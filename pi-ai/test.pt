@@ -1,0 +1,210 @@
+from fastapi import FastAPI, UploadFile, File, Form, Body
+from fastapi.responses import JSONResponse
+import uvicorn
+import pathlib
+import json
+import os
+from datetime import datetime
+from services import etts, gemini, youtube, payload
+from dotenv import load_dotenv
+from pydantic import BaseModel
+from typing import List, Dict
+
+load_dotenv()
+
+app = FastAPI()
+
+@app.post("/process-pdf/")
+async def process_pdf(
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    course_id: int = Form(...)
+):    # Save uploaded file to disk
+    temp_path = pathlib.Path(file.filename)
+    with temp_path.open("wb") as buffer:
+        buffer.write(await file.read())
+
+    prompt = (
+        "Read the content of the provided PDF and create a well-structured, informative lesson designed to help students learn the material effectively. "
+        "Output only an array of properly formatted Lexical block nodes for Payload CMS. "
+        "Each text node must include: detail: 0, format: 0, mode: 'normal', style: '', text: 'content', type: 'text', version: 1. "
+        "Each container node must include: children: [...], direction: 'ltr', format: '', indent: 0, type: 'paragraph/heading/list', version: 1. "
+        "For headings add 'tag': 'h1/h2/h3'. For lists add 'listType': 'bullet/number', 'start': 1, 'tag': 'ul/ol'. "
+        "For paragraphs add 'textFormat': 0, 'textStyle': ''. Output valid JSON only - just the children array."
+    )
+
+    # 1. Gemini: PDF to Lexical JSON (children array only)
+    lexical_children = gemini.pdf_to_lexical(str(temp_path), prompt)
+    if isinstance(lexical_children, str):
+        lexical_children = json.loads(lexical_children)
+
+    # Generate narration and keywords using Gemini
+    narration = gemini.lexical_to_narration(lexical_children)
+    keywords = gemini.get_keywords(lexical_children)
+
+    # Auto-search YouTube with generated keywords
+    youtube_videos = youtube.search_videos(keywords, max_results=10)
+
+    # Generate TTS audio for narration using Edge TTS (save as mp3)
+    audio_dir = pathlib.Path("media")
+    audio_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+    audio_path = audio_dir / f"narration_{timestamp}.mp3"
+    await etts.text_to_mp3(narration, str(audio_path))
+
+    # Instead of uploading audio, just store the local audio path and alt for later upload
+    audio_alt = f"audio_{timestamp}"
+    audio_metadata = {
+        "type": "upload-local-audio",
+        "version": 3,
+        "format": "",
+        "id": audio_alt,
+        "fields": None,
+        "relationTo": "media-local",
+        "value": {
+            "local_path": str(audio_path),
+            "alt": audio_alt,
+            "filename": audio_path.name,
+            "mimeType": "audio/mp3",
+            "filesize": os.path.getsize(audio_path),
+        }
+    }
+
+    # Insert audio metadata as the first child in lexical_children
+    lexical_children = [audio_metadata] + lexical_children
+
+    # Bundle lesson data in Payload CMS format (with narration, keywords, and audio metadata)
+    lesson_data = {
+        "title": title,
+        "content": {
+            "root": {
+                "children": lexical_children,
+                "direction": "ltr",
+                "format": "",
+                "indent": 0,
+                "type": "root",
+                "version": 1
+            }
+        },
+        "published": True,
+        "course": {"id": course_id},
+    }
+
+    # Clean up temp file
+    temp_path.unlink(missing_ok=True)
+
+    return JSONResponse(content={
+        "lesson_data": lesson_data,
+        "keywords": keywords,
+        "youtube_videos": youtube_videos
+    })
+
+class FinishRequest(BaseModel):
+    selected_videos: List[Dict]
+    lesson_data: Dict
+
+@app.post("/finish/")
+async def finish(request: FinishRequest):
+    # Upload audio file to Payload CMS (find the local audio node)
+    lexical_children = request.lesson_data["content"]["root"]["children"]
+    audio_node = lexical_children[0]
+    audio_local = audio_node["value"]
+    audio_path = audio_local["local_path"]
+    audio_alt = audio_local["alt"]
+    audio_payload = payload.upload_media(audio_path, media_type="audio", alt=audio_alt)
+    # Build the correct audio metadata node (Payload CMS expects type 'upload' and relationTo 'media')
+    audio_metadata = {
+        "type": "upload",
+        "version": 3,
+        "format": "",
+        "id": audio_alt,  # Use alt as Lexical node ID
+        "fields": None,
+        "relationTo": "media",
+        "value": audio_payload  # Use Payload response directly
+    }
+    # Replace the first node (audio) with the uploaded audio node
+    lexical_children[0] = audio_metadata
+
+    # Download and upload each selected video
+    video_nodes = []
+    for idx, video in enumerate(request.selected_videos):
+        video_url = video["url"]
+        # Download video to local media directory
+        video_dir = pathlib.Path("media")
+        video_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+        video_filename = f"video_{idx}_{timestamp}.mp4"
+        video_path = video_dir / video_filename
+        youtube.download_video(video_url, str(video_path))
+        # Upload to Payload CMS
+        video_alt = f"video_{idx}_{timestamp}"
+        payload_result = payload.upload_media(str(video_path), media_type="video", alt=video_alt)
+        # Prepare video metadata node (type 'upload', relationTo 'media')        video_metadata = {
+            "type": "upload",
+            "version": 3,
+            "format": "",
+            "id": video_alt,  # Use alt as Lexical node ID
+            "fields": None,
+            "relationTo": "media",
+            "value": payload_result
+        }
+        video_nodes.append(video_metadata)
+        # Optionally, delete local video file after upload
+        video_path.unlink(missing_ok=True)
+
+    # Insert video nodes after the audio node in lexical children
+    lexical_children = [lexical_children[0]] + video_nodes + lexical_children[1:]
+    request.lesson_data["content"]["root"]["children"] = lexical_children
+
+    # Upload the lesson to Payload CMS
+    lesson_upload_result = payload.upload_lesson(request.lesson_data)
+
+    return JSONResponse(content={"lesson": request.lesson_data, "payload_result": lesson_upload_result})
+
+@app.post("/cleanup/")
+async def cleanup():
+    # Delete temp files in /media
+    media_dir = pathlib.Path("media")
+    for f in media_dir.glob("*"):
+        f.unlink()
+    return {"status": "cleaned"}
+
+@app.post("/search-youtube/")
+async def search_youtube(keywords: list = Body(..., embed=True)):
+    """
+    Search YouTube for videos matching the given keywords.
+    Expects: {"keywords": ["keyword1", "keyword2", ...]}
+    Returns: List of video metadata (title, videoId, thumbnail, url)
+    """
+    results = youtube.search_videos(keywords, max_results=10)
+    return {"videos": results}
+
+from fastapi import HTTPException
+
+@app.post("/add-youtube-video/")
+async def add_youtube_video(link: str = Body(..., embed=True)):
+    """
+    Accepts a YouTube video link, fetches its metadata, and returns it in the same format as search results.
+    Expects: {"link": "https://www.youtube.com/watch?v=VIDEO_ID"}
+    """
+    import re
+
+    # Extract video ID from the link
+    match = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", link)
+    if not match:
+        raise HTTPException(status_code=400, detail="Invalid YouTube link.")
+    video_id = match.group(1)
+
+    # Fetch video metadata using YouTube API
+    video_data = youtube.search_videos([video_id], max_results=1)
+    if not video_data:
+        raise HTTPException(status_code=404, detail="Video not found.")
+
+    return {"video": video_data[0]}
+
+if __name__ == "__main__":
+    uvicorn.run("api:app", host="localhost", port=8000, reload=True)
+
+
+
+
