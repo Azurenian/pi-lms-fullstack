@@ -17,7 +17,7 @@
         "-y",
         "@modelcontextprotocol/server-sequential-thinking"
       ],
-      "disabled": true,
+      "disabled": false,
       "alwaysAllow": []
     },
     "memory": {
@@ -36,7 +36,7 @@
         "@agentdeskai/browser-tools-mcp"
       ],
       "cwd": "C:\\Users\\lalou\\Documents\\Cline\\MCP\\browser-tools-mcp",
-      "disabled": true,
+      "disabled": false,
       "alwaysAllow": []
     }
   }

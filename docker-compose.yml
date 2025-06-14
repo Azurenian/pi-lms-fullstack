@@ -1,0 +1,271 @@
+version: "3.8"
+
+services:
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: pi-lms-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./data/ssl:/etc/ssl/certs:ro
+      - media-volume:/var/www/media:ro
+      - ./data/logs/nginx:/var/log/nginx
+    depends_on:
+      - frontend
+      - backend
+      - ai-services
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.5"
+    networks:
+      - pi-lms-network
+
+  # Frontend Service
+  frontend:
+    build:
+      context: ./pi-frontend
+      dockerfile: Dockerfile
+    container_name: pi-lms-frontend
+    environment:
+      - ENVIRONMENT=production
+      - PAYLOAD_CMS_URL=http://backend:3000
+      - AI_SERVICE_URL=http://ai-services:8000
+      - REDIS_URL=redis://redis:6379/0
+      - SESSION_SECRET=${SESSION_SECRET:-change-this-secret-in-production}
+      - FRONTEND_HOST=0.0.0.0
+      - FRONTEND_PORT=8080
+      - DEBUG=false
+    volumes:
+      - media-volume:/app/media
+      - ./data/logs/frontend:/app/logs
+    depends_on:
+      - backend
+      - redis
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+    networks:
+      - pi-lms-network
+
+  # Backend Service (PayloadCMS)
+  backend:
+    build:
+      context: ./pi-lms-backend
+      dockerfile: Dockerfile
+    container_name: pi-lms-backend
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URI=sqlite:///app/data/lms-payload.db
+      - PAYLOAD_SECRET=${PAYLOAD_SECRET:-change-this-payload-secret}
+      - PAYLOAD_PORT=3000
+      - PAYLOAD_PUBLIC_SERVER_URL=http://pilms.local
+      - REDIS_URL=redis://redis:6379/1
+    volumes:
+      - database-volume:/app/data
+      - media-volume:/app/media
+      - ./data/logs/backend:/app/logs
+    depends_on:
+      - redis
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "2.0"
+    networks:
+      - pi-lms-network
+
+  # AI Services
+  ai-services:
+    build:
+      context: ./pi-ai
+      dockerfile: Dockerfile
+    container_name: pi-lms-ai
+    environment:
+      - ENVIRONMENT=production
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - YOUTUBE_API_KEY=${YOUTUBE_API_KEY}
+      - OLLAMA_HOST=http://ollama:11434
+      - PAYLOAD_BASE_URL=http://backend:3000
+      - REDIS_URL=redis://redis:6379/2
+      - LLM_MODEL=llama3.2:3b
+      - LLM_MAX_TOKENS=2000
+      - LLM_TEMPERATURE=0.7
+      - ENABLE_LOCAL_LLM=true
+      - LOG_LEVEL=info
+    volumes:
+      - media-volume:/app/media
+      - ./data/ai-temp:/app/temp
+      - ./data/logs/ai:/app/logs
+    depends_on:
+      - ollama
+      - redis
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "3.0"
+    networks:
+      - pi-lms-network
+
+  # Ollama Local LLM Runtime
+  ollama:
+    image: ollama/ollama:latest
+    container_name: pi-lms-ollama
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_MODELS=/root/.ollama/models
+      - OLLAMA_NUM_PARALLEL=2
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_FLASH_ATTENTION=1
+    volumes:
+      - ollama-volume:/root/.ollama
+      - ./data/logs/ollama:/var/log/ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/version"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+          cpus: "4.0"
+        reservations:
+          memory: 1G
+    networks:
+      - pi-lms-network
+
+  # Redis Cache and Session Store
+  redis:
+    image: redis:7-alpine
+    container_name: pi-lms-redis
+    command: >
+      redis-server 
+      --appendonly yes 
+      --maxmemory 256mb 
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-volume:/data
+      - ./data/logs/redis:/var/log/redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+    networks:
+      - pi-lms-network
+
+  # Performance Testing Service
+  testing:
+    build:
+      context: ./testing
+      dockerfile: Dockerfile
+    container_name: pi-lms-testing
+    ports:
+      - "9000:9000"
+    environment:
+      - PI_AI_URL=http://ai-services:8000
+      - PI_FRONTEND_URL=http://frontend:8080
+      - PI_BACKEND_URL=http://backend:3000
+      - OLLAMA_URL=http://ollama:11434
+      - REDIS_URL=redis://redis:6379/3
+      - TESTING_MODE=production
+      - LOG_LEVEL=info
+    volumes:
+      - testing-volume:/app/results
+      - ./data/logs/testing:/app/logs
+      - ./data/testing-reports:/app/reports
+    depends_on:
+      - frontend
+      - backend
+      - ai-services
+      - ollama
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 180s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "2.0"
+    networks:
+      - pi-lms-network
+
+# Persistent volumes for data
+volumes:
+  database-volume:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/database
+
+  media-volume:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/media
+
+  ollama-volume:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/ollama
+
+  redis-volume:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/redis
+
+  testing-volume:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/testing
+
+# Internal network for service communication
+networks:
+  pi-lms-network:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: pi-lms-br0
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1
